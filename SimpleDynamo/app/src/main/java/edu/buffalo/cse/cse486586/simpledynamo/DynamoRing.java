@@ -34,11 +34,11 @@ public class DynamoRing {
     private String[] recoveryNode5560 = {NODE_5562_PORT,NODE_5558_PORT,NODE_5554_PORT};
     private String[] recoveryNode5562 = {NODE_5556_PORT,NODE_5560_PORT,NODE_5558_PORT};
 
-    private String[] recoveryContact5554 = {NODE_5558_PORT,NODE_5556_PORT};
-    private String[] recoveryContact5556 = {NODE_5554_PORT,NODE_5562_PORT};
-    private String[] recoveryContact5558 = {NODE_5560_PORT,NODE_5554_PORT};
-    private String[] recoveryContact5560 = {NODE_5562_PORT,NODE_5558_PORT};
-    private String[] recoveryContact5562 = {NODE_5556_PORT,NODE_5560_PORT};
+    private String[] recoveryContact5554 = {NODE_5558_PORT,NODE_5562_PORT,NODE_5556_PORT};
+    private String[] recoveryContact5556 = {NODE_5554_PORT,NODE_5560_PORT,NODE_5562_PORT};
+    private String[] recoveryContact5558 = {NODE_5560_PORT,NODE_5556_PORT,NODE_5554_PORT};
+    private String[] recoveryContact5560 = {NODE_5562_PORT,NODE_5554_PORT,NODE_5558_PORT};
+    private String[] recoveryContact5562 = {NODE_5556_PORT,NODE_5558_PORT,NODE_5560_PORT};
 
     public String[] getReplicationList(String port){
         switch(Integer.parseInt(port)) {

@@ -12,11 +12,9 @@ import java.net.SocketTimeoutException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Formatter;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import android.content.ContentProvider;
 import android.content.ContentValues;
@@ -56,10 +54,16 @@ public class SimpleDynamoProvider extends ContentProvider {
     private static final String QUERY_REPLICA = "QUERY_REPLICA";
     private static final String QUERY_REPLICA_ACK = "QUERY_REPLICA_ACK";
     private static final String REPLICATE_TO_SUCCESSOR = "REPLICATE_TO_SUCCESSOR";
+    public static final Object recoverySync = new Object();
+    public static final Object querySync = new Object();
+    public static final Object queryReplicaSync = new Object();
+//    public static final Object insertSync = new Object();
 
     private ConcurrentHashMap<String, String> myData = new ConcurrentHashMap<String, String>();
     private ConcurrentHashMap<String, String> predecessor1Data = new ConcurrentHashMap<String, String>();
     private ConcurrentHashMap<String, String> predecessor2Data = new ConcurrentHashMap<String, String>();
+    private ConcurrentHashMap<String, Integer> versionData = new ConcurrentHashMap<String, Integer>();
+    AtomicInteger version = new AtomicInteger(1);
 
     @Override
     public int delete(Uri uri, String selection, String[] selectionArgs) {
@@ -118,7 +122,6 @@ public class SimpleDynamoProvider extends ContentProvider {
             } else {
                 boolean success = contactCoordinatorAndDelete(selection, coordinator);
                 if (!success) {
-                    Log.e("delete", "coordinator is dead!");
                     replicateDelete(selection, coordinator, replicationList);
                 }
             }
@@ -133,13 +136,11 @@ public class SimpleDynamoProvider extends ContentProvider {
             socket.setSoTimeout(1500);
             PrintStream printStream = new PrintStream(socket.getOutputStream());
             String messageToSend = COORDINATOR_DELETE + ":" + selection;
-            Log.e("conCoordForInsert", "message to send " + messageToSend);
             printStream.println(messageToSend);
 
             InputStreamReader inputStreamReader = new InputStreamReader(socket.getInputStream());
             BufferedReader bufferedReader = new BufferedReader(inputStreamReader);
             String messageReceived = bufferedReader.readLine();
-            Log.e("conCoordForInsert", "message to received " + messageReceived);
             String[] msg = messageReceived.split(":");
             if (msg[0].contains(COORDINATOR_DELETE_ACK)) {
                 socket.close();
@@ -168,13 +169,11 @@ public class SimpleDynamoProvider extends ContentProvider {
                 socket.setSoTimeout(1500);
                 PrintStream printStream = new PrintStream(socket.getOutputStream());
                 String messageToSend = REPLICATION_DELETE + ":" + selection + ":" + coordinator;
-                Log.e("replicateData", "message to send " + messageToSend);
                 printStream.println(messageToSend);
 
                 InputStreamReader inputStreamReader = new InputStreamReader(socket.getInputStream());
                 BufferedReader bufferedReader = new BufferedReader(inputStreamReader);
                 String messageReceived = bufferedReader.readLine();
-                Log.e("replicateData", "message to received " + messageReceived);
                 String[] msg = messageReceived.split(":");
                 if (msg[0].equals(REPLICATION_DELETE_ACK)) {
                     socket.close();
@@ -203,25 +202,28 @@ public class SimpleDynamoProvider extends ContentProvider {
         String key = values.getAsString(KEY);
         String value = values.getAsString(VALUE);
         String coordinator = dynamoRing.getCoordinator(hashedKey);
-        Log.e("insert", "insert request for " + key +":" +value+ " at " + MY_PORT);
-        Log.e("insert", "coordinator " + coordinator + " for hash " + hashedKey);
         String[] replicationList = dynamoRing.getReplicationList(coordinator);
+        Log.e("Insert","Insert request for " + key + " " + value + " at " + MY_PORT);
         if (MY_PORT.equals(coordinator)) {
             myData.put(key, value);
+            if(versionData.containsKey(key))
+                versionData.put(key,version.incrementAndGet());
+            else
+                versionData.put(key,version.get());
             dbWriter.insertWithOnConflict(SimpleDynamoContract.MessageEntry.TABLE_NAME, null,
                     values, SQLiteDatabase.CONFLICT_REPLACE);
-            Log.e("insert", "replication List " + replicationList[0] + " " + replicationList[1]);
+            Log.e("Insert","At coordinator Inserted " + key + " " + value + " at " + MY_PORT);
             boolean success = replicateFromCoordinator(key, value, coordinator, replicationList[0]);
             if (!success) {
+                Log.e("Insert","Coordinator failed sending " + key + " " + value + " to " + replicationList[1]);
                 replicateToNext(key, value, coordinator, replicationList[1]);
             }
         } else {
-            Log.e("insert else", "contactCoordinatorForInsert");
+            Log.e("Insert","I'm not coordinator! sending to coordinator " + key + " " + value + " at " + coordinator);
             boolean success = contactCoordinatorForInsert(key, value, coordinator);
             if (!success) {
-                Log.e("insert", "coordinator is dead!");
+                Log.e("Insert","I'm not coordinator! sending to coordinator failed, replicating " + key + " " + value + " at " + replicationList[0]);
                 replicateToNext(key, value, coordinator, replicationList[0]);
-//                replicateToNext(key, value, coordinator, replicationList[1]);
             }
         }
         return null;
@@ -234,13 +236,13 @@ public class SimpleDynamoProvider extends ContentProvider {
             socket.setSoTimeout(1500);
             PrintStream printStream = new PrintStream(socket.getOutputStream());
             String messageToSend = REPLICATE_TO_SUCCESSOR + ":" + coordinator + ":" + key + ":" + value;
-            Log.e("conCoordForInsert", "message to send " + messageToSend);
             printStream.println(messageToSend);
+            Log.e("replicateFromCordinator", "Replicating from coordinator " + messageToSend + " at " + port);
 
             InputStreamReader inputStreamReader = new InputStreamReader(socket.getInputStream());
             BufferedReader bufferedReader = new BufferedReader(inputStreamReader);
             String messageReceived = bufferedReader.readLine();
-            Log.e("conCoordForInsert", "message to received " + messageReceived);
+            Log.e("replicateFromCordinator", "Reply from the replica " + messageReceived + " at " + MY_PORT);
             if (messageReceived != null)
                 socket.close();
             else
@@ -250,11 +252,9 @@ public class SimpleDynamoProvider extends ContentProvider {
             ne.printStackTrace();
             return false;
         } catch (SocketException se) {
-            Log.e("replicateFromCoo","SocketException");
             se.printStackTrace();
             return false;
         } catch (SocketTimeoutException set) {
-            Log.e("replicateFromCoo","SocketTimeoutException");
             set.printStackTrace();
             return false;
         } catch (IOException io) {
@@ -271,27 +271,24 @@ public class SimpleDynamoProvider extends ContentProvider {
             socket.setSoTimeout(1500);
             PrintStream printStream = new PrintStream(socket.getOutputStream());
             String messageToSend = COORDINATOR_REPLICATION + ":" + coordinator + ":" + key + ":" + value;
-            Log.e("conCoordForInsert", "message to send " + messageToSend);
             printStream.println(messageToSend);
+            Log.e("COORDINATOR_REPLICATION","Sending to the coordinator " + messageToSend + " at " + coordinator);
 
             InputStreamReader inputStreamReader = new InputStreamReader(socket.getInputStream());
             BufferedReader bufferedReader = new BufferedReader(inputStreamReader);
             String messageReceived = bufferedReader.readLine();
-            Log.e("conCoordForInsert", "message to received " + messageReceived);
+            Log.e("COORDINATOR_REPLICATION","Received from the coordinator " + messageReceived + " at " + MY_PORT);
             if (messageReceived != null)
                 socket.close();
             else
                 return false;
         } catch (NullPointerException ne) {
-            Log.e("contactCoordinatorForI","NullPointerException");
             ne.printStackTrace();
             return false;
         } catch (SocketException se) {
-            Log.e("contactCoordinatorForI","SocketException");
             se.printStackTrace();
             return false;
         } catch (SocketTimeoutException set) {
-            Log.e("contactCoordinatorForI","SocketTimeoutException");
             set.printStackTrace();
             return false;
         } catch (IOException io) {
@@ -306,90 +303,96 @@ public class SimpleDynamoProvider extends ContentProvider {
                         String[] selectionArgs, String sortOrder) {
         Cursor cursor;
         String[] selectionItems = selection.split(":");
-        if (selection.equals("@")) {
-            Log.e("if query", "selection " + selection);
-            cursor = dbReader.query(SimpleDynamoContract.MessageEntry.TABLE_NAME, null, null, null,
-                    null, null, null);
-            return cursor;
-        } else if (selection.equals("*")) {
-            Log.e("elif query", "selection " + selection);
-            MatrixCursor matrixCursor = new MatrixCursor(new String[]{KEY, VALUE});
-            for (String port : dynamoRing.getAllNodesPort()) {
-                if (MY_PORT.equals(port)) {
-                    Log.e("query", "from my port");
-                    Cursor myCursor = dbReader.query(SimpleDynamoContract.MessageEntry.TABLE_NAME, null, null, null,
-                            null, null, null);
-                    if (myCursor != null && myCursor.getCount() > 0) {
-                        myCursor.moveToFirst();
-                        while (!myCursor.isAfterLast()) {
-                            String key = myCursor.getString(myCursor.getColumnIndex(KEY));
-                            String value = myCursor.getString(myCursor.getColumnIndex(VALUE));
-                            matrixCursor.newRow().add(KEY, key)
-                                    .add(VALUE, value);
-                            myCursor.moveToNext();
+        synchronized (recoverySync) {
+            if (selection.equals("@")) {
+                cursor = dbReader.query(SimpleDynamoContract.MessageEntry.TABLE_NAME, null, null, null,
+                        null, null, null);
+                return cursor;
+            } else if (selection.equals("*")) {
+                MatrixCursor matrixCursor = new MatrixCursor(new String[]{KEY, VALUE});
+                for (String port : dynamoRing.getAllNodesPort()) {
+                    if (MY_PORT.equals(port)) {
+                        Cursor myCursor = dbReader.query(SimpleDynamoContract.MessageEntry.TABLE_NAME, null, null, null,
+                                null, null, null);
+                        if (myCursor != null && myCursor.getCount() > 0) {
+                            myCursor.moveToFirst();
+                            while (!myCursor.isAfterLast()) {
+                                String key = myCursor.getString(myCursor.getColumnIndex(KEY));
+                                String value = myCursor.getString(myCursor.getColumnIndex(VALUE));
+                                matrixCursor.newRow().add(KEY, key)
+                                        .add(VALUE, value);
+                                myCursor.moveToNext();
+                            }
                         }
+                        continue;
                     }
-                    continue;
-                }
-                try {
-                    Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
-                            Integer.parseInt(port));
-                    socket.setSoTimeout(1500);
-                    PrintStream printStream = new PrintStream(socket.getOutputStream());
-                    String messageToSend = COORDINATOR_ALL_QUERY + ":" + "*";
-                    printStream.println(messageToSend);
-                    Log.e("query", "message to send " + messageToSend);
+                    try {
+                        Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
+                                Integer.parseInt(port));
+                        socket.setSoTimeout(1500);
+                        PrintStream printStream = new PrintStream(socket.getOutputStream());
+                        String messageToSend = COORDINATOR_ALL_QUERY + ":" + "*";
+                        printStream.println(messageToSend);
 
-                    InputStreamReader inputStreamReader = new InputStreamReader(socket.getInputStream());
-                    BufferedReader bufferedReader = new BufferedReader(inputStreamReader);
-                    String messageReceived = bufferedReader.readLine();
-                    Log.e("query", "message to send " + messageToSend);
-                    String[] msg = messageReceived.split(":");
-                    if (msg[0].contains(COORDINATOR_ALL_QUERY_ACK)) {
-                        String[] content = msg[1].split("==");
-                        for (int j = 0; j < content.length; j++) {
-                            matrixCursor.newRow().add(KEY, content[j].split(";")[0])
-                                    .add(VALUE, content[j].split(";")[1]);
+                        InputStreamReader inputStreamReader = new InputStreamReader(socket.getInputStream());
+                        BufferedReader bufferedReader = new BufferedReader(inputStreamReader);
+                        String messageReceived = bufferedReader.readLine();
+                        String[] msg = messageReceived.split(":");
+                        if (msg[0].contains(COORDINATOR_ALL_QUERY_ACK)) {
+                            String[] content = msg[1].split("==");
+                            for (int j = 0; j < content.length; j++) {
+                                matrixCursor.newRow().add(KEY, content[j].split(";")[0])
+                                        .add(VALUE, content[j].split(";")[1]);
+                            }
+                        }
+                        socket.close();
+                    } catch (NullPointerException ne) {
+                        ne.printStackTrace();
+                    } catch (SocketException se) {
+                        se.printStackTrace();
+                    } catch (SocketTimeoutException set) {
+                        set.printStackTrace();
+                    } catch (IOException io) {
+                        io.printStackTrace();
+                    }
+                }
+                return matrixCursor;
+            } else {
+                String coordinator = dynamoRing.getCoordinator(genHash(selectionItems[0]));
+                String selectionItem = SimpleDynamoContract.MessageEntry.COLUMN_KEY + " = ?";
+                String[] selectionArg = new String[]{selectionItems[0]};
+                String[] replicationList = dynamoRing.getReplicationList(coordinator);
+                Log.e("query","received query " + selectionItems[0] + " at " + MY_PORT);
+                if (MY_PORT.equals(coordinator)) {
+                    cursor = dbReader.query(SimpleDynamoContract.MessageEntry.TABLE_NAME, null,
+                            selectionItem, selectionArg, null, null, null);
+                    if (cursor == null || cursor.getCount() == 0) {
+                        Log.e("query","coordinator returned no rows, contacting successor " + selectionItems[0] + " at " + replicationList[0]);
+                        cursor = contactReplicasForQuery(selectionItems[0], coordinator, replicationList[0]);
+                        if (cursor == null) {
+                            Log.e("query","sucessor1 returned no rows, contacting successor2 " + selectionItems[0] + " at " + replicationList[1]);
+                            return contactReplicasForQuery(selectionItems[0], coordinator, replicationList[1]);
                         }
                     }
-                    socket.close();
-                } catch (NullPointerException ne) {
-                    ne.printStackTrace();
-                } catch (SocketException se) {
-                    se.printStackTrace();
-                } catch (SocketTimeoutException set) {
-                    set.printStackTrace();
-                } catch (IOException io) {
-                    io.printStackTrace();
+                    else
+                        Log.e("query","I'm coordinator, replying for " + selectionItems[0] + " from " + MY_PORT);
+                } else {
+                    cursor = contactCoordinatorForQuery(selectionItems[0], coordinator);
+                    if (cursor == null) {
+                        Log.e("query","coordinator for " + selectionItems[0] + " replied null contacting " +replicationList[0]);
+                        cursor = contactReplicasForQuery(selectionItems[0], coordinator, replicationList[0]);
+                        if (cursor == null) {
+                            Log.e("query", "replica2 for " + selectionItems[0] + " replied");
+                            return contactReplicasForQuery(selectionItems[0], coordinator, replicationList[1]);
+                        }
+                        else
+                            Log.e("query","replica1 for " + selectionItems[0] + " replied");
+                    }
+                    else
+                        Log.e("query","coordinator for " + selectionItems[0] + " replied ");
                 }
+                return cursor;
             }
-            return matrixCursor;
-        } else {
-            String coordinator = dynamoRing.getCoordinator(genHash(selectionItems[0]));
-            String selectionItem = SimpleDynamoContract.MessageEntry.COLUMN_KEY + " = ?";
-            String[] selectionArg = new String[]{selectionItems[0]};
-            String[] replicationList = dynamoRing.getReplicationList(coordinator);
-            if (MY_PORT.equals(coordinator)) {
-                Log.e("query","got query at coordinator: " + coordinator + "for key "+selectionItems[0] );
-                cursor = dbReader.query(SimpleDynamoContract.MessageEntry.TABLE_NAME, null,
-                        selectionItem, selectionArg, null, null, null);
-                if(cursor == null || cursor.getCount() == 0) {
-                    Log.e("query","if coordinator returned null for "+ selectionItems[0]);
-                    cursor = contactReplicasForQuery(selectionItems[0], coordinator, replicationList[0]);
-                    if (cursor == null)
-                        return contactReplicasForQuery(selectionItems[0], coordinator, replicationList[1]);
-                }
-            } else {
-                Log.e("query","sending query from " + coordinator + "for key "+selectionItems[0] );
-                cursor = contactCoordinatorForQuery(selectionItems[0], coordinator);
-                if (cursor == null) {
-                    Log.e("query","else coordinator returned null for "+ selectionItems[0]);
-                    cursor = contactReplicasForQuery(selectionItems[0], coordinator, replicationList[0]);
-                    if (cursor == null)
-                        return contactReplicasForQuery(selectionItems[0], coordinator, replicationList[1]);
-                }
-            }
-            return cursor;
         }
     }
 
@@ -401,13 +404,13 @@ public class SimpleDynamoProvider extends ContentProvider {
             socket.setSoTimeout(1500);
             PrintStream printStream = new PrintStream(socket.getOutputStream());
             String messageToSend = QUERY_REPLICA + ":" + selectionItem;
-            Log.e("contactRepForQuery", "message to send for query to " + port +  messageToSend);
             printStream.println(messageToSend);
+            Log.e("contactReplicasForQuery","contacting replica " + messageToSend + " at " + port);
 
             InputStreamReader inputStreamReader = new InputStreamReader(socket.getInputStream());
             BufferedReader bufferedReader = new BufferedReader(inputStreamReader);
             String messageReceived = bufferedReader.readLine();
-            Log.e("contactRepForQuery", "message received for key " + selectionItem +" " + messageReceived);
+            Log.e("contactReplicasForQuery","reply from replica " + messageReceived + " at " + MY_PORT);
             if(messageReceived == null)
                 return null;
             String[] msg = messageReceived.split(":");
@@ -441,13 +444,13 @@ public class SimpleDynamoProvider extends ContentProvider {
             socket.setSoTimeout(1500);
             PrintStream printStream = new PrintStream(socket.getOutputStream());
             String messageToSend = COORDINATOR_QUERY + ":" + selectionItem;
-            Log.e("contactCoorForQuery", "message to send for query to coordinator" + coordinator +  messageToSend);
             printStream.println(messageToSend);
+            Log.e("contctCordinatorFrQuery","Contacting coordinator for query " + selectionItem + " at " + coordinator);
 
             InputStreamReader inputStreamReader = new InputStreamReader(socket.getInputStream());
             BufferedReader bufferedReader = new BufferedReader(inputStreamReader);
             String messageReceived = bufferedReader.readLine();
-            Log.e("contactCoorForQuery", "message received for key " + selectionItem +" " + messageReceived);
+            Log.e("contctCordinatorFrQuery","reply from coordinator for query " + messageReceived + " at " + MY_PORT);
             if(messageReceived == null) {
                 return null;
             }
@@ -527,53 +530,58 @@ public class SimpleDynamoProvider extends ContentProvider {
                     String message = bufferedReader.readLine();
 
                     String[] messageParts = message.split(":");
-
                     if (messageParts[0].equals(COORDINATOR_REPLICATION)) {
                         ContentValues values = new ContentValues();
                         String coordinator = messageParts[1];
                         values.put(KEY, messageParts[2]);
                         values.put(VALUE, messageParts[3]);
                         myData.put(messageParts[2], messageParts[3]);
+                        if(versionData.containsKey(messageParts[2]))
+                            versionData.put(messageParts[2],version.getAndIncrement());
+                        else
+                            versionData.put(messageParts[2],version.get());
 
-                        Log.e("ServerTask", "Replication data " + messageParts[1] + " " + messageParts[2]);
                         dbWriter.insertWithOnConflict(SimpleDynamoContract.MessageEntry.TABLE_NAME, null,
                                 values, SQLiteDatabase.CONFLICT_REPLACE);
+                        Log.e("COORDINATOR_REPLICATION", "Insert received at " + MY_PORT + " for " + messageParts[2] + " " + messageParts[3]);
 
                         boolean success = replicateFromCoordinator(messageParts[2], messageParts[3], coordinator, dynamoRing.getSuccessor(MY_PORT));
+                        Log.e("COORDINATOR_REPLICATION", "replicated to successor 1 : " + success + " at " + dynamoRing.getSuccessor(MY_PORT));
                         if (!success) {
+                            Log.e("COORDINATOR_REPLICATION", "replicated to successor at " + dynamoRing.getSuccessor(dynamoRing.getSuccessor(MY_PORT)));
                             replicateToNext(messageParts[2], messageParts[3], coordinator, dynamoRing.getSuccessor(dynamoRing.getSuccessor(MY_PORT)));
                         }
                     } else if (messageParts[0].equals(COORDINATOR_QUERY)) {
-                        Log.e("ServerTask", "COORDINATOR_QUERY");
-                        String selectionItem = SimpleDynamoContract.MessageEntry.COLUMN_KEY + " = ?";
-                        String[] selectionArgs = new String[]{messageParts[1]};
-                        Log.e("Server","query received at coordinator " + messageParts[1]);
-                        Cursor cursor = dbReader.query(SimpleDynamoContract.MessageEntry.TABLE_NAME, null, selectionItem, selectionArgs,
-                                null, null, null);
-                        String messageToSend = "";
-                        if (cursor != null && cursor.getCount() > 0) {
-                            cursor.moveToFirst();
-                            while (!cursor.isAfterLast()) {
-                                String key = cursor.getString(cursor.getColumnIndex(KEY));
-                                String value = cursor.getString(cursor.getColumnIndex(VALUE));
-                                if (messageToSend.isEmpty()) {
-                                    messageToSend += COORDINATOR_QUERY_ACK + ":" + key + ";" + value;
+                        synchronized (querySync) {
+                            String selectionItem = SimpleDynamoContract.MessageEntry.COLUMN_KEY + " = ?";
+                            String[] selectionArgs = new String[]{messageParts[1]};
+                            Cursor cursor = dbReader.query(SimpleDynamoContract.MessageEntry.TABLE_NAME, null, selectionItem, selectionArgs,
+                                    null, null, null);
+                            String messageToSend = "";
+                            if (cursor != null && cursor.getCount() > 0) {
+                                cursor.moveToFirst();
+                                while (!cursor.isAfterLast()) {
+                                    String key = cursor.getString(cursor.getColumnIndex(KEY));
+                                    String value = cursor.getString(cursor.getColumnIndex(VALUE));
+                                    if (messageToSend.isEmpty()) {
+                                        messageToSend += COORDINATOR_QUERY_ACK + ":" + key + ";" + value;
 
-                                } else
-                                    messageToSend += "==" + key + ";" + value;
-                                cursor.moveToNext();
+                                    } else
+                                        messageToSend += "==" + key + ";" + value;
+                                    cursor.moveToNext();
+                                }
+                            } else {
+                                messageToSend = COORDINATOR_QUERY_ACK + ":";
                             }
-                        } else {
-                            messageToSend = COORDINATOR_QUERY_ACK + ":";
+                            PrintStream printStream = new PrintStream(socket.getOutputStream());
+                            printStream.println(messageToSend);
+                            Log.e("COORDINATOR_QUERY", "Replying from the coordinator " + MY_PORT + " " + messageToSend);
+                            printStream.flush();
+                            if (cursor != null)
+                                cursor.close();
+                            socket.close();
+                            continue;
                         }
-                        PrintStream printStream = new PrintStream(socket.getOutputStream());
-                        printStream.println(messageToSend);
-                        Log.e("ServerTask", "COORDINATOR_QUERY_ACK messageToSend from coordinator" + messageToSend);
-                        printStream.flush();
-                        if (cursor != null)
-                            cursor.close();
-                        socket.close();
-                        continue;
                     } else if (messageParts[0].equals(COORDINATOR_ALL_QUERY)) {
                         Cursor myCursor = null;
                         myCursor = dbReader.query(SimpleDynamoContract.MessageEntry.TABLE_NAME, null, null, null,
@@ -593,7 +601,6 @@ public class SimpleDynamoProvider extends ContentProvider {
                         }
                         PrintStream printStream = new PrintStream(socket.getOutputStream());
                         printStream.println(messageToSend);
-                        Log.e("ServerTask", "COORDINATOR_ALL_QUERY_ACK messageToSend " + messageToSend);
                         printStream.flush();
                         if (myCursor != null)
                             myCursor.close();
@@ -646,7 +653,6 @@ public class SimpleDynamoProvider extends ContentProvider {
                         if (myData.isEmpty() && predecessor1Data.isEmpty())
                             messageToSend = RECOVERY_ACK + ":" + "";
                         if (fromPort.equals(dynamoRing.getSuccessor(MY_PORT))) {
-                            Log.e("server rec", "sending pred12 data");
                             if (!myData.isEmpty()) {
                                 for (Map.Entry<String, String> entry : myData.entrySet()) {
                                     if (messagePart1.isEmpty()) {
@@ -668,10 +674,19 @@ public class SimpleDynamoProvider extends ContentProvider {
 
                             messageToSend = RECOVERY_ACK + ":" + MY_PORT + ":" + messagePart1 + "<>" + messagePart2;
 
+                        } else if (fromPort.equals(dynamoRing.getSuccessor(dynamoRing.getSuccessor(MY_PORT)))) {
+                            if (!myData.isEmpty()) {
+                                for (Map.Entry<String, String> entry : myData.entrySet()) {
+                                    if (messageToSend.isEmpty()) {
+                                        messageToSend += RECOVERY_ACK + ":" + MY_PORT + ":"
+                                                + entry.getKey() + ";" + entry.getValue();
+                                    } else
+                                        messageToSend += "==" + entry.getKey() + ";" + entry.getValue();
+                                }
+                            } else
+                                messageToSend = RECOVERY_ACK + ":" + "";
                         } else if (fromPort.equals(dynamoRing.getPredecessor(MY_PORT))) {
-                            Log.e("server rec", "sending pred1 data");
                             if (!predecessor1Data.isEmpty()) {
-                                Log.e("RECOVERY", "sending pred1 data");
                                 for (Map.Entry<String, String> entry : predecessor1Data.entrySet()) {
                                     if (messageToSend.isEmpty()) {
                                         messageToSend += RECOVERY_ACK + ":" + MY_PORT + ":"
@@ -683,40 +698,40 @@ public class SimpleDynamoProvider extends ContentProvider {
                                 messageToSend = RECOVERY_ACK + ":" + "";
                         }
                         PrintStream printStream = new PrintStream(socket.getOutputStream());
-                        Log.e("server rec", "message to send: " + messageToSend);
                         printStream.println(messageToSend);
+                        Log.e("Recovery", "Sending recovery response from " + MY_PORT + " " + messageToSend);
                         printStream.flush();
                         socket.close();
                         continue;
                     } else if (messageParts[0].equals(QUERY_REPLICA)) {
-                        Cursor cursor;
-                        String selectionItem = SimpleDynamoContract.MessageEntry.COLUMN_KEY + " = ?";
-                        String[] selectionArgs = new String[]{messageParts[1]};
-                        Log.e("server","query received at replica port " + MY_PORT + " " + messageParts[1]);
-                        cursor = dbReader.query(SimpleDynamoContract.MessageEntry.TABLE_NAME, null, selectionItem, selectionArgs,
-                                null, null, null);
-                        String messageToSend = "";
-                        if (cursor != null && cursor.getCount() > 0) {
-                            cursor.moveToFirst();
-                            while (!cursor.isAfterLast()) {
-                                String key = cursor.getString(cursor.getColumnIndex(KEY));
-                                String value = cursor.getString(cursor.getColumnIndex(VALUE));
-                                if (messageToSend.isEmpty()) {
-                                    messageToSend += QUERY_REPLICA_ACK + ":" + key + ";" + value;
+                        synchronized (queryReplicaSync) {
+                            Cursor cursor;
+                            String selectionItem = SimpleDynamoContract.MessageEntry.COLUMN_KEY + " = ?";
+                            String[] selectionArgs = new String[]{messageParts[1]};
+                            cursor = dbReader.query(SimpleDynamoContract.MessageEntry.TABLE_NAME, null, selectionItem, selectionArgs,
+                                    null, null, null);
+                            String messageToSend = "";
+                            if (cursor != null && cursor.getCount() > 0) {
+                                cursor.moveToFirst();
+                                while (!cursor.isAfterLast()) {
+                                    String key = cursor.getString(cursor.getColumnIndex(KEY));
+                                    String value = cursor.getString(cursor.getColumnIndex(VALUE));
+                                    if (messageToSend.isEmpty()) {
+                                        messageToSend += QUERY_REPLICA_ACK + ":" + key + ";" + value;
+                                    }
+                                    cursor.moveToNext();
                                 }
-                                cursor.moveToNext();
-                            }
-                            cursor.close();
-                        }
-                        else
-                            messageToSend = QUERY_REPLICA_ACK + ":";
+                                cursor.close();
+                            } else
+                                messageToSend = QUERY_REPLICA_ACK + ":";
 
-                        PrintStream printStream = new PrintStream(socket.getOutputStream());
-                        Log.e("server","message to send from replica " + MY_PORT + " " + messageToSend);
-                        printStream.println(messageToSend);
-                        printStream.flush();
-                        socket.close();
-                        continue;
+                            PrintStream printStream = new PrintStream(socket.getOutputStream());
+                            printStream.println(messageToSend);
+                            Log.e("QUERY_REPLICA", "Replying from the query replica " + MY_PORT + " " + messageToSend);
+                            printStream.flush();
+                            socket.close();
+                            continue;
+                        }
                     } else if (messageParts[0].equals(REPLICATE_TO_SUCCESSOR)) {
                         ContentValues values = new ContentValues();
                         String coordinator = messageParts[1];
@@ -724,15 +739,27 @@ public class SimpleDynamoProvider extends ContentProvider {
                         values.put(VALUE, messageParts[3]);
                         dbWriter.insertWithOnConflict(SimpleDynamoContract.MessageEntry.TABLE_NAME, null,
                                 values, SQLiteDatabase.CONFLICT_REPLACE);
+                        Log.e("REPLICATE_TO_SUCCESSOR", "Replicate request for " + messageParts[2] + " " + messageParts[3] + " received at " + MY_PORT);
                         if (coordinator.equals(dynamoRing.getPredecessor(MY_PORT))) {
                             predecessor1Data.put(messageParts[2], messageParts[3]);
+                            if(versionData.containsKey(messageParts[2])) {
+                                versionData.put(messageParts[2],version.getAndIncrement());
+                            }
+                            else
+                                versionData.put(messageParts[2],version.get());
                         } else if (coordinator.equals(dynamoRing.getPredecessor(dynamoRing.getPredecessor(MY_PORT)))) {
                             predecessor2Data.put(messageParts[2], messageParts[3]);
+                            if(versionData.containsKey(messageParts[2])) {
+                                versionData.put(messageParts[2],version.getAndIncrement());
+                            }
+                            else
+                                versionData.put(messageParts[2],version.get());
                         }
-                        Log.e("ServerTask", "Replication data " + messageParts[1] + " " + messageParts[2]);
                         String[] replicationList = dynamoRing.getReplicationList(coordinator);
-                        if (!MY_PORT.equals(replicationList[1]))
+                        if (!MY_PORT.equals(replicationList[1])) {
+                            Log.e("REPLICATE_TO_SUCCESSOR", "Replicate to successor " + messageParts[2] + " " + messageParts[3] + " at " + dynamoRing.getSuccessor(MY_PORT));
                             replicateToNext(messageParts[2], messageParts[3], coordinator, dynamoRing.getSuccessor(MY_PORT));
+                        }
                     }
                     PrintStream printStream = new PrintStream(socket.getOutputStream());
                     printStream.println(ACK_MESSAGE);
@@ -764,68 +791,135 @@ public class SimpleDynamoProvider extends ContentProvider {
             String[] message = msgs[0].split(":");
             String messageType = msgs[1];
             if (messageType.equals(RECOVERY)) {
-                String[] recoveryList = dynamoRing.getRecoveryContactList(MY_PORT);
-                for (String port : recoveryList) {
+                synchronized (recoverySync) {
+                    synchronized (querySync) {
+                        synchronized (queryReplicaSync) {
+                            String[] recoveryList = dynamoRing.getRecoveryContactList(MY_PORT);
+                            for (String port : recoveryList) {
+                                try {
+                                    socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
+                                            Integer.parseInt(port));
+                                    socket.setSoTimeout(1500);
+                                    PrintStream printStream = new PrintStream(socket.getOutputStream());
+                                    String messageToSend = RECOVERY + ":" + MY_PORT;
+                                    printStream.println(messageToSend);
+                                    Log.e("RECOVERY CT","REQUESTING RECOVERY DATA! for " + MY_PORT);
+
+                                    InputStreamReader inputStreamReader = new InputStreamReader(socket.getInputStream());
+                                    BufferedReader bufferedReader = new BufferedReader(inputStreamReader);
+                                    String messageReceived = bufferedReader.readLine();
+                                    if (messageReceived.contains(RECOVERY_ACK)) {
+                                        String[] msg = messageReceived.split(":");
+                                        if (msg.length > 1) {
+                                            if (msg[1].equals(dynamoRing.getPredecessor(MY_PORT))) {
+                                                ContentValues values = new ContentValues();
+                                                String[] data = msg[2].split("<>");
+                                                if (!data[0].equals("null")) {
+                                                    String[] content = data[0].split("==");
+                                                    for (int i = 0; i < content.length; i++) {
+                                                        if (!predecessor1Data.containsKey(content[i].split(";")[0])) {
+                                                            Log.e("Recovery","adding to pred1 data " + content[i].split(";")[0]+ " "+ content[i].split(";")[1] + " to database");
+                                                            predecessor1Data.put(content[i].split(";")[0],
+                                                                    content[i].split(";")[1]);
+                                                            if(versionData.containsKey(content[i].split(";")[0]))
+                                                                versionData.put(content[i].split(";")[0],version.getAndIncrement());
+                                                            else
+                                                                versionData.put(content[i].split(";")[0],version.get());
+                                                            values.put(KEY, content[i].split(";")[0]);
+                                                            values.put(VALUE, content[i].split(";")[1]);
+                                                            dbWriter.insertWithOnConflict(SimpleDynamoContract.MessageEntry.TABLE_NAME, null,
+                                                                    values, SQLiteDatabase.CONFLICT_REPLACE);
+                                                        }
+                                                    }
+                                                }
+                                                if (!data[1].equals("null")) {
+                                                    String[] content = data[1].split("==");
+                                                    for (int j = 0; j < content.length; j++) {
+                                                        if (!predecessor2Data.containsKey(content[j].split(";")[0])) {
+                                                            Log.e("Recovery","adding to pred2 data " + content[j].split(";")[0]+ " "+ content[j].split(";")[1] + " to database");
+                                                            predecessor2Data.put(content[j].split(";")[0],
+                                                                    content[j].split(";")[1]);
+                                                            if(versionData.containsKey(content[j].split(";")[0]))
+                                                                versionData.put(content[j].split(";")[0],version.getAndIncrement());
+                                                            else
+                                                                versionData.put(content[j].split(";")[0],version.get());
+                                                            values.put(KEY, content[j].split(";")[0]);
+                                                            values.put(VALUE, content[j].split(";")[1]);
+                                                            dbWriter.insertWithOnConflict(SimpleDynamoContract.MessageEntry.TABLE_NAME, null,
+                                                                    values, SQLiteDatabase.CONFLICT_REPLACE);
+                                                        }
+                                                    }
+                                                }
+                                            } else if (msg[1].equals(dynamoRing.getSuccessor(MY_PORT))) {
+                                                ContentValues values = new ContentValues();
+                                                String[] content = msg[2].split("==");
+                                                for (int j = 0; j < content.length; j++) {
+                                                    if (!myData.containsKey(content[j].split(";")[0])) {
+                                                        Log.e("Recovery","adding to my data " + content[j].split(";")[0]+ " "+ content[j].split(";")[1] + " to database");
+                                                        myData.put(content[j].split(";")[0],
+                                                                content[j].split(";")[1]);
+                                                        if(versionData.containsKey(content[j].split(";")[0]))
+                                                            versionData.put(content[j].split(";")[0],version.getAndIncrement());
+                                                        else
+                                                            versionData.put(content[j].split(";")[0],version.get());
+                                                        values.put(KEY, content[j].split(";")[0]);
+                                                        values.put(VALUE, content[j].split(";")[1]);
+                                                        dbWriter.insertWithOnConflict(SimpleDynamoContract.MessageEntry.TABLE_NAME, null,
+                                                                values, SQLiteDatabase.CONFLICT_REPLACE);
+                                                    }
+                                                }
+                                            } else if (msg[1].equals(dynamoRing.getPredecessor(dynamoRing.getPredecessor(MY_PORT)))) {
+                                                ContentValues values = new ContentValues();
+                                                String[] content = msg[2].split("==");
+                                                for (int j = 0; j < content.length; j++) {
+                                                    if (!predecessor2Data.containsKey(content[j].split(";")[0])) {
+                                                        Log.e("Recovery","adding to pred2 data " + content[j].split(";")[0]+ " "+ content[j].split(";")[1] + " to database");
+                                                        predecessor2Data.put(content[j].split(";")[0],
+                                                                content[j].split(";")[1]);
+                                                        if(versionData.containsKey(content[j].split(";")[0]))
+                                                            versionData.put(content[j].split(";")[0],version.getAndIncrement());
+                                                        else
+                                                            versionData.put(content[j].split(";")[0],version.get());
+                                                        values.put(KEY, content[j].split(";")[0]);
+                                                        values.put(VALUE, content[j].split(";")[1]);
+                                                        dbWriter.insertWithOnConflict(SimpleDynamoContract.MessageEntry.TABLE_NAME, null,
+                                                                values, SQLiteDatabase.CONFLICT_REPLACE);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        printStream.close();
+                                        socket.close();
+                                    }
+                                } catch (NullPointerException ne) {
+                                    ne.printStackTrace();
+                                } catch (SocketException se) {
+                                    se.printStackTrace();
+                                } catch (SocketTimeoutException set) {
+                                    set.printStackTrace();
+                                } catch (IOException io) {
+                                    io.printStackTrace();
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (messageType.equals(REPLICATE_TO_SUCCESSOR)) {
+                synchronized (queryReplicaSync) {
                     try {
                         socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
-                                Integer.parseInt(port));
+                                Integer.parseInt(msgs[3]));
                         socket.setSoTimeout(1500);
                         PrintStream printStream = new PrintStream(socket.getOutputStream());
-                        String messageToSend = RECOVERY + ":" + MY_PORT;
-                        Log.e("recoveryData", "message to send " + messageToSend);
+                        String messageToSend = REPLICATE_TO_SUCCESSOR + ":" + msgs[2] + ":" + message[0] + ":" + message[1];
                         printStream.println(messageToSend);
+                        Log.e("REPLICATE_TO_SUCCESSOR", "Replicating to successor " + messageToSend + " at " + msgs[3]);
 
                         InputStreamReader inputStreamReader = new InputStreamReader(socket.getInputStream());
                         BufferedReader bufferedReader = new BufferedReader(inputStreamReader);
                         String messageReceived = bufferedReader.readLine();
-                        Log.e("recoveryData", "message received " + messageReceived);
-                        if (messageReceived.contains(RECOVERY_ACK)) {
-                            String[] msg = messageReceived.split(":");
-                            if (msg.length > 1) {
-                                if (msg[1].equals(dynamoRing.getPredecessor(MY_PORT))) {
-                                    ContentValues values = new ContentValues();
-                                    String[] data = msg[2].split("<>");
-                                    if (!data[0].equals("null")) {
-                                        String[] content = data[0].split("==");
-                                        for (int i = 0; i < content.length; i++) {
-                                            if(!predecessor1Data.containsKey(content[i].split(";")[0])) {
-                                                predecessor1Data.put(content[i].split(";")[0],
-                                                        content[i].split(";")[1]);
-                                                values.put(KEY, content[i].split(";")[0]);
-                                                values.put(VALUE, content[i].split(";")[1]);
-                                                dbWriter.insertWithOnConflict(SimpleDynamoContract.MessageEntry.TABLE_NAME, null,
-                                                        values, SQLiteDatabase.CONFLICT_REPLACE);
-                                            }
-                                        }
-                                    }
-                                    if (!data[1].equals("null")) {
-                                        String[] content = data[1].split("==");
-                                        for (int j = 0; j < content.length; j++) {
-                                            if(!predecessor2Data.containsKey(content[j].split(";")[0])) {
-                                                predecessor2Data.put(content[j].split(";")[0],
-                                                        content[j].split(";")[1]);
-                                                values.put(KEY, content[j].split(";")[0]);
-                                                values.put(VALUE, content[j].split(";")[1]);
-                                                dbWriter.insertWithOnConflict(SimpleDynamoContract.MessageEntry.TABLE_NAME, null,
-                                                        values, SQLiteDatabase.CONFLICT_REPLACE);
-                                            }
-                                        }
-                                    }
-                                } else if (msg[1].equals(dynamoRing.getSuccessor(MY_PORT))) {
-                                    ContentValues values = new ContentValues();
-                                    String[] content = msg[2].split("==");
-                                    for (int j = 0; j < content.length; j++) {
-                                        if(!myData.containsKey(content[j].split(";")[0])) {
-                                            myData.put(content[j].split(";")[0],
-                                                    content[j].split(";")[1]);
-                                            values.put(KEY, content[j].split(";")[0]);
-                                            values.put(VALUE, content[j].split(";")[1]);
-                                            dbWriter.insertWithOnConflict(SimpleDynamoContract.MessageEntry.TABLE_NAME, null,
-                                                    values, SQLiteDatabase.CONFLICT_REPLACE);
-                                        }
-                                    }
-                                }
-                            }
+                        Log.e("REPLICATE_TO_SUCCESSOR", "message received from replica " + messageReceived);
+                        if (messageReceived != null) {
                             printStream.close();
                             socket.close();
                         }
@@ -838,32 +932,6 @@ public class SimpleDynamoProvider extends ContentProvider {
                     } catch (IOException io) {
                         io.printStackTrace();
                     }
-                }
-            } else if (messageType.equals(REPLICATE_TO_SUCCESSOR)) {
-                try {
-                    socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
-                            Integer.parseInt(msgs[3]));
-                    socket.setSoTimeout(1500);
-                    PrintStream printStream = new PrintStream(socket.getOutputStream());
-                    String messageToSend = REPLICATE_TO_SUCCESSOR + ":" + msgs[2] + ":" + message[0] + ":" + message[1];
-                    Log.e("recoveryData", "message to send " + messageToSend);
-                    printStream.println(messageToSend);
-
-                    InputStreamReader inputStreamReader = new InputStreamReader(socket.getInputStream());
-                    BufferedReader bufferedReader = new BufferedReader(inputStreamReader);
-                    String messageReceived = bufferedReader.readLine();
-                    if (messageReceived != null) {
-                        printStream.close();
-                        socket.close();
-                    }
-                } catch (NullPointerException ne) {
-                    ne.printStackTrace();
-                } catch (SocketException se) {
-                    se.printStackTrace();
-                } catch (SocketTimeoutException set) {
-                    set.printStackTrace();
-                } catch (IOException io) {
-                    io.printStackTrace();
                 }
             }
             return null;
